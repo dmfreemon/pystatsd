@@ -45,6 +45,14 @@ TIMER_MSG = '''%(prefix)s.%(key)s.lower %(min)s %(ts)s
 %(prefix)s.%(key)s.upper_%(pct_threshold)s %(max_threshold)s %(ts)s
 '''
 
+def _extract_from_host_address(full_key):
+    # separated by colon
+    idx = full_key.find(":")
+    assert idx >= 0
+    from_host_address = full_key[0:idx]
+    key = full_key[idx+1:]
+    return from_host_address, key
+
 
 class Server(object):
 
@@ -99,7 +107,7 @@ class Server(object):
             call([self.gmetric_exec, self.gmetric_options, "-u", units, "-g", group, "-t", "double", "-n",  k, "-v", str(v) ])
 
 
-    def process(self, data):
+    def process(self, data, from_host_address):
         # the data is a sequence of newline-delimited metrics
         # a metric is in the form "name:value|rest"  (rest may have more pipes)
         data.rstrip('\n')
@@ -116,9 +124,12 @@ class Server(object):
             rest  = match.group(3).split('|')
             mtype = rest.pop(0)
 
-            if   (mtype == 'ms'): self.__record_timer(key, value, rest)
-            elif (mtype == 'g' ): self.__record_gauge(key, value, rest)
-            elif (mtype == 'c' ): self.__record_counter(key, value, rest)
+            # can use colon since it is guaranteed not to be present in the key
+            full_key = from_host_address + ":" + key
+
+            if   (mtype == 'ms'): self.__record_timer(full_key, value, rest)
+            elif (mtype == 'g' ): self.__record_gauge(full_key, value, rest)
+            elif (mtype == 'c' ): self.__record_counter(full_key, value, rest)
             else:
                 warn("Encountered unknown metric type in <%s>" % (metric))
 
@@ -165,6 +176,9 @@ class Server(object):
             g = gmetric.Gmetric(self.ganglia_host, self.ganglia_port, self.ganglia_protocol)
 
         for k, (v, t) in self.counters.items():
+            from_host_address, unqualified_k = _extract_from_host_address(k)
+            ganglia_spoof_host = from_host_address + ":" + from_host_address
+
             if self.expire > 0 and t + self.expire < ts:
                 if self.debug:
                     print("Expiring counter %s (age: %s)" % (k, ts -t))
@@ -177,23 +191,26 @@ class Server(object):
                 print("Sending %s => count=%s" % (k, v))
 
             if self.transport == 'graphite':
-                msg = '%s.%s %s %s\n' % (self.counters_prefix, k, v, ts)
+                msg = '%s.%s %s %s\n' % (self.counters_prefix, unqualified_k, v, ts)
                 stat_string += msg
             elif self.transport == 'ganglia':
                 # We put counters in _counters group. Underscore is to make sure counters show up
                 # first in the GUI. Change below if you disagree
-                if len(k) >= self.ganglia_max_length:
-                    log.debug("Ganglia metric too long. Ignoring: %s" % k)
+                if len(unqualified_k) >= self.ganglia_max_length:
+                    log.debug("Ganglia metric too long. Ignoring: %s" % unqualified_k)
                 else:
-                    g.send(k, v, "double", "count", "both", 60, self.dmax, "_counters", self.ganglia_spoof_host)
+                    g.send(unqualified_k, v, "double", "count", "both", 60, self.dmax, "_counters", ganglia_spoof_host)
             elif self.transport == 'ganglia-gmetric':
-                self.send_to_ganglia_using_gmetric(k,v, "_counters", "count")
+                self.send_to_ganglia_using_gmetric(unqualfied_k, v, "_counters", "count")
 
             # Clear the counter once the data is sent
             del(self.counters[k])
             stats += 1
 
         for k, (v, t) in self.gauges.items():
+            from_host_address, unqualified_k = _extract_from_host_address(k)
+            ganglia_spoof_host = from_host_address + ":" + from_host_address
+
             if self.expire > 0 and t + self.expire < ts:
                 if self.debug:
                     print("Expiring gauge %s (age: %s)" % (k, ts - t))
@@ -206,19 +223,22 @@ class Server(object):
 
             if self.transport == 'graphite':
                 # note: counters and gauges implicitly end up in the same namespace
-                msg = '%s.%s %s %s\n' % (self.counters_prefix, k, v, ts)
+                msg = '%s.%s %s %s\n' % (self.counters_prefix, unqualified_k, v, ts)
                 stat_string += msg
             elif self.transport == 'ganglia':
-                if len(k) >= self.ganglia_max_length:
-                    log.debug("Ganglia metric too long. Ignoring: %s" % k)
+                if len(unqualified_k) >= self.ganglia_max_length:
+                    log.debug("Ganglia metric too long. Ignoring: %s" % unqualified_k)
                 else:
-                    g.send(k, v, "double", "count", "both", 60, self.dmax, "_gauges", self.ganglia_spoof_host)
+                    g.send(unqualified_k, v, "double", "count", "both", 60, self.dmax, "_gauges", ganglia_spoof_host)
             elif self.transport == 'ganglia-gmetric':
-                self.send_to_ganglia_using_gmetric(k,v, "_gauges", "gauge")
+                self.send_to_ganglia_using_gmetric(unqualified_k, v, "_gauges", "gauge")
 
             stats += 1
 
         for k, (v, t) in self.timers.items():
+            from_host_address, unqualified_k = _extract_from_host_address(k)
+            ganglia_spoof_host = from_host_address + ":" + from_host_address
+
             if self.expire > 0 and t + self.expire < ts:
                 if self.debug:
                     print("Expiring timer %s (age: %s)" % (k, ts - t))
@@ -250,7 +270,7 @@ class Server(object):
 
                     stat_string += TIMER_MSG % {
                         'prefix': self.timers_prefix,
-                        'key': k,
+                        'key': unqualified_k,
                         'mean': mean,
                         'max': max,
                         'min': min,
@@ -264,24 +284,24 @@ class Server(object):
                     # We are gonna convert all times into seconds, then let rrdtool add proper SI unit. This avoids things like
                     # 3521 k ms which is 3.521 seconds
                     # What group should these metrics be in. For the time being we'll set it to the name of the key
-                    if len(k) >= self.ganglia_max_length:
-                        log.debug("Ganglia metric too long. Ignoring: %s" % k)
+                    if len(unqualified_k) >= self.ganglia_max_length:
+                        log.debug("Ganglia metric too long. Ignoring: %s" % unqualified_k)
                     else:
-                        group = k
-                        g.send(k + "_min", min / 1000, "double", "seconds", "both", 60, self.dmax, group, self.ganglia_spoof_host)
-                        g.send(k + "_mean", mean / 1000, "double", "seconds", "both", 60, self.dmax, group, self.ganglia_spoof_host)
-                        g.send(k + "_max", max / 1000, "double", "seconds", "both", 60, self.dmax, group, self.ganglia_spoof_host)
-                        g.send(k + "_count", count, "double", "count", "both", 60, self.dmax, group, self.ganglia_spoof_host)
-                        g.send(k + "_" + str(self.pct_threshold) + "pct", max_threshold / 1000, "double", "seconds", "both", 60, self.dmax, group, self.ganglia_spoof_host)
+                        group = unqualified_k
+                        g.send(unqualified_k + "_min", min / 1000, "double", "seconds", "both", 60, self.dmax, group, ganglia_spoof_host)
+                        g.send(unqualified_k + "_mean", mean / 1000, "double", "seconds", "both", 60, self.dmax, group, ganglia_spoof_host)
+                        g.send(unqualified_k + "_max", max / 1000, "double", "seconds", "both", 60, self.dmax, group, ganglia_spoof_host)
+                        g.send(unqualified_k + "_count", count, "double", "count", "both", 60, self.dmax, group, ganglia_spoof_host)
+                        g.send(unqualified_k + "_" + str(self.pct_threshold) + "pct", max_threshold / 1000, "double", "seconds", "both", 60, self.dmax, group, ganglia_spoof_host)
                 elif self.transport == 'ganglia-gmetric':
                     # We are gonna convert all times into seconds, then let rrdtool add proper SI unit. This avoids things like
                     # 3521 k ms which is 3.521 seconds
-                    group = k
-                    self.send_to_ganglia_using_gmetric(k + "_mean", mean / 1000, group, "seconds")
-                    self.send_to_ganglia_using_gmetric(k + "_min",  min / 1000 , group, "seconds")
-                    self.send_to_ganglia_using_gmetric(k + "_max",  max / 1000, group, "seconds")
-                    self.send_to_ganglia_using_gmetric(k + "_count", count , group, "count")
-                    self.send_to_ganglia_using_gmetric(k + "_" + str(self.pct_threshold) + "pct",  max_threshold / 1000, group, "seconds")
+                    group = unqualified_k
+                    self.send_to_ganglia_using_gmetric(unqualified_k + "_mean", mean / 1000, group, "seconds")
+                    self.send_to_ganglia_using_gmetric(unqualified_k + "_min",  min / 1000 , group, "seconds")
+                    self.send_to_ganglia_using_gmetric(unqualified_k + "_max",  max / 1000, group, "seconds")
+                    self.send_to_ganglia_using_gmetric(unqualified_k + "_count", count , group, "count")
+                    self.send_to_ganglia_using_gmetric(unqualified_k + "_" + str(self.pct_threshold) + "pct",  max_threshold / 1000, group, "seconds")
 
                 stats += 1
 
@@ -333,10 +353,11 @@ class Server(object):
         self._set_timer()
         while 1:
             data, addr = self._sock.recvfrom(self.buf)
+            from_host_address = addr[0]
             try:
-                self.process(data)
+                self.process(data, from_host_address)
             except Exception as error:
-                log.error("Bad data from %s: %s",addr,error) 
+                log.error("Bad data from %s: %s", addr, error)
 
 
     def stop(self):
