@@ -1,0 +1,17 @@
+[Unit]
+Description=Pystatsd Service
+#After=network.target
+#After=multi-user.target
+After=gmond.service
+
+[Service]
+Type=simple
+User=nobody
+Group=nobody
+Restart=always
+Environment="PYTHONPATH=/opt/pystatsd" "PYTHONUNBUFFERED=True"
+ExecStart=/opt/pystatsd/bin/pystatsd-server --debug --flush-interval 2000 --port 8125 --transport ganglia --ganglia-host 127.0.0.1 --ganglia-port 8649
+
+[Install]
+WantedBy=multi-user.target
+
